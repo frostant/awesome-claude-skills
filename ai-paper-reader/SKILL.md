@@ -389,6 +389,224 @@ fig{序号}_{类型}_{简述}.png
 
 ---
 
+## 图片提取工具
+
+学术论文中的图表有两种类型，需要不同的提取方式：
+
+| 类型 | 特点 | 提取方法 |
+|------|------|---------|
+| **嵌入式图片** | 作者插入的 PNG/JPEG | `get_images()` |
+| **矢量图形** | 架构图、流程图等绘制的图形 | `cluster_drawings()` |
+
+### 方法 1: 提取嵌入式图片
+
+适用于论文中直接插入的位图（如实验结果截图、照片等）：
+
+```python
+import fitz  # PyMuPDF
+import os
+
+def extract_embedded_images(pdf_path, output_dir):
+    """提取 PDF 中嵌入的位图"""
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        images = page.get_images(full=True)
+
+        for img_idx, img in enumerate(images):
+            xref = img[0]
+            base = doc.extract_image(xref)
+            image_bytes = base["image"]
+            image_ext = base["ext"]
+
+            # 过滤过小的图片（可能是图标/装饰）
+            if base["width"] > 100 and base["height"] > 100:
+                output_path = f"{output_dir}/page{page_num+1}_img{img_idx+1}.{image_ext}"
+                with open(output_path, "wb") as f:
+                    f.write(image_bytes)
+
+    doc.close()
+```
+
+### 方法 2: 提取矢量图形（推荐）
+
+适用于论文中绑制的架构图、流程图、图表等矢量图形：
+
+```python
+import fitz
+import os
+
+def extract_vector_figures(pdf_path, output_dir, dpi=200, min_size=100):
+    """
+    使用 cluster_drawings() 识别矢量图形区域并截图
+
+    Args:
+        pdf_path: PDF 文件路径
+        output_dir: 输出目录
+        dpi: 输出分辨率（默认 200，可提高到 300 获得更清晰的图片）
+        min_size: 最小尺寸阈值，过滤装饰线条（默认 100pt）
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+
+    figures = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+
+        # 识别矢量图形的聚类区域
+        # x_tolerance/y_tolerance 控制相邻元素的合并距离
+        try:
+            drawing_rects = page.cluster_drawings(
+                x_tolerance=3,
+                y_tolerance=3
+            )
+        except Exception:
+            # 某些 PDF 可能不支持，跳过
+            continue
+
+        for idx, rect in enumerate(drawing_rects):
+            # 过滤过小的区域（可能是线条/装饰）
+            if rect.width < min_size or rect.height < min_size:
+                continue
+
+            # 扩展边界，避免裁切太紧
+            rect = rect + (-10, -10, 10, 10)
+            # 确保不超出页面边界
+            rect = rect & page.rect
+
+            # 高分辨率截图
+            zoom = dpi / 72
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=rect)
+
+            output_path = f"{output_dir}/page{page_num+1}_fig{idx+1}.png"
+            pix.save(output_path)
+            figures.append({
+                "page": page_num + 1,
+                "path": output_path,
+                "rect": rect
+            })
+
+    doc.close()
+    return figures
+```
+
+### 方法 3: 手动指定区域截取
+
+当自动识别效果不理想时，可手动指定坐标：
+
+```python
+import fitz
+
+def crop_figure(pdf_path, page_num, rect, output_path, dpi=200):
+    """
+    从 PDF 指定页面裁剪特定区域
+
+    Args:
+        pdf_path: PDF 路径
+        page_num: 页码（从 1 开始）
+        rect: (x0, y0, x1, y1) 坐标，单位为点(pt)，72pt = 1英寸
+        output_path: 输出图片路径
+        dpi: 分辨率
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+
+    clip = fitz.Rect(rect)
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+
+    pix = page.get_pixmap(matrix=mat, clip=clip)
+    pix.save(output_path)
+    doc.close()
+
+# 使用示例：裁剪第 2 页的某个区域
+# 坐标可通过 PDF 阅读器查看，或先用方法 2 识别后微调
+crop_figure(
+    "paper.pdf",
+    page_num=2,
+    rect=(50, 100, 550, 400),  # 左上角(50,100) 到 右下角(550,400)
+    output_path="./images/fig1_architecture.png"
+)
+```
+
+### 智能提取（综合方案）
+
+自动尝试多种方法，提取所有图表：
+
+```python
+import fitz
+import os
+
+def smart_extract_figures(pdf_path, output_dir, dpi=200):
+    """
+    智能提取论文中的所有图表
+    1. 先使用 cluster_drawings 识别矢量图形
+    2. 再提取嵌入式位图
+    3. 自动过滤和去重
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    results = {"vector": [], "embedded": []}
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+
+        # 1. 提取矢量图形
+        try:
+            rects = page.cluster_drawings(x_tolerance=3, y_tolerance=3)
+            for idx, rect in enumerate(rects):
+                if rect.width > 100 and rect.height > 100:
+                    rect = (rect + (-10, -10, 10, 10)) & page.rect
+                    zoom = dpi / 72
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect)
+                    path = f"{output_dir}/p{page_num+1}_vec{idx+1}.png"
+                    pix.save(path)
+                    results["vector"].append(path)
+        except:
+            pass
+
+        # 2. 提取嵌入式图片
+        for img_idx, img in enumerate(page.get_images(full=True)):
+            xref = img[0]
+            base = doc.extract_image(xref)
+            if base["width"] > 100 and base["height"] > 100:
+                path = f"{output_dir}/p{page_num+1}_img{img_idx+1}.{base['ext']}"
+                with open(path, "wb") as f:
+                    f.write(base["image"])
+                results["embedded"].append(path)
+
+    doc.close()
+    print(f"提取完成: {len(results['vector'])} 个矢量图, {len(results['embedded'])} 个位图")
+    return results
+
+# 使用示例
+results = smart_extract_figures("paper.pdf", "./images/")
+```
+
+### 常见问题
+
+**Q: 提取的图片包含多个 Figure 合在一起？**
+
+调小 `x_tolerance` 和 `y_tolerance` 参数（如 1-2），使聚类更严格。
+
+**Q: 同一个 Figure 被切成多块？**
+
+调大容差参数（如 10-20），使相邻元素合并。
+
+**Q: 某些 Figure 没有被识别？**
+
+1. 可能是嵌入式图片，尝试 `get_images()` 方法
+2. 使用手动指定区域的方法
+
+**Q: 图片模糊？**
+
+提高 `dpi` 参数到 300 或更高。
+
+---
+
 ## 使用方式
 
 ### 基本用法
